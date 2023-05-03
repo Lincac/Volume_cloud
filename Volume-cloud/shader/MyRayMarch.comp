@@ -1,0 +1,293 @@
+#version 430 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D outCloudTex;
+
+uniform sampler3D cloud;
+uniform sampler3D worley32;
+uniform sampler2D weatherTex;
+
+uniform vec2 Resolution;
+
+uniform float absorption;
+uniform float coverage;
+uniform float crispiness;
+uniform float curliness;
+uniform float densityFactor;
+uniform float speed;
+uniform float type;
+
+uniform vec3 lightDirection;
+uniform vec3 lightPosition;
+
+uniform vec3 cloudColorTop;
+uniform vec3 cloudColorBottom;
+uniform vec3 skyColorTop;
+uniform vec3 skyColorBottom;
+
+uniform vec3 lightCol;
+
+uniform float iTime;
+uniform vec3 cameraPosition;
+uniform mat4 inv_projection;
+uniform mat4 inv_view;
+
+#define CLOUD_STEP 64
+#define LIGHT_STEP 6
+
+const vec3 _minBox = vec3(-200,100,-200);
+const vec3 _maxBox = vec3(200,200,200);
+
+// Cloud types height density gradients
+#define STRATUS_GRADIENT vec4(0.0, 0.1, 0.2, 0.3)
+#define STRATOCUMULUS_GRADIENT vec4(0.02, 0.2, 0.48, 0.625)
+#define CUMULUS_GRADIENT vec4(0.00, 0.1625, 0.88, 0.98)
+
+vec3 getWorldDir(){
+    vec4 ndc = vec4(0.0);
+    ndc.x  = (gl_GlobalInvocationID.x/Resolution.x) * 2.0 - 1.0;
+    ndc.y  = (gl_GlobalInvocationID.y/Resolution.y) * 2.0 - 1.0;
+    ndc.z  =  1.0;
+    ndc.w = 1.0 ;
+
+    vec4 view_pos = inv_projection * ndc;
+    view_pos = vec4(view_pos.xy,-1.0,0.0);
+    vec3 worldDir = (inv_view * view_pos).xyz;
+    return normalize(worldDir);
+}
+
+vec4 getSkyColor(){
+    vec3 worldDir = getWorldDir();
+
+    vec3 col = mix(skyColorBottom, skyColorTop, clamp(1 - exp(8.5-17.*clamp(normalize(worldDir).y*0.5 + 0.5,0.0,1.0)),0.0,1.0));
+	float sun = clamp( dot(lightDirection,worldDir), 0.0, 1.0 );
+	col += 0.8*vec3(1.0,.6,0.1)*pow(sun, 350);
+
+	return vec4(col, 1.0);
+}
+
+bool HitBox(in vec3 ro,in vec3 rd,out vec3 startPos,out vec3 endPos){
+    vec3 _min = (_minBox - ro) / rd;
+    vec3 _max = (_maxBox - ro) / rd;
+
+    vec3 tmin = min(_min,_max);
+    vec3 tmax = max(_min,_max);
+
+    float t1 = max(tmin.x,max(tmin.y,tmin.z));
+    float t2 = min(tmax.x,min(tmax.y,tmax.z));
+
+    if(t1 < t2 && t2 > 0){
+        t1 = max(0,t1);
+        startPos = ro + t1 * rd;
+        endPos = ro + t2 * rd;
+        return true;
+    }
+    return false;
+}
+
+float threshold(const float v, const float t)
+{
+	return v > t ? v : 0.0;
+}
+
+float HG( float sundotrd, float g) {
+	float gg = g * g;
+	return (1. - gg) / pow( 1. + gg - 2. * g * sundotrd, 1.5) ;
+}
+
+vec2 getUVProjection(vec3 p){
+	return (p.xz / _maxBox.xz + 1) / 2;
+}
+
+float getHeightFraction(vec3 inPos){
+	return (inPos.y - _minBox.y) / (_maxBox.y - _minBox.y);
+}
+
+float remap(float originalValue, float originalMin, float originalMax, float newMin, float newMax)
+{
+	return newMin + (((originalValue - originalMin) / (originalMax - originalMin)) * (newMax - newMin));
+}
+
+float getDensityForCloud(float heightFraction, float cloudType)
+{
+	float stratusFactor = 1.0 - clamp(cloudType * 2.0, 0.0, 1.0);
+	float stratoCumulusFactor = 1.0 - abs(cloudType - 0.5) * 2.0;
+	float cumulusFactor = clamp(cloudType - 0.5, 0.0, 1.0) * 2.0;
+
+	vec4 baseGradient = stratusFactor * STRATUS_GRADIENT + stratoCumulusFactor * STRATOCUMULUS_GRADIENT + cumulusFactor * CUMULUS_GRADIENT;
+
+	return smoothstep(baseGradient.x, baseGradient.y, heightFraction) - smoothstep(baseGradient.z, baseGradient.w, heightFraction);
+}
+
+const vec3 windDirection = normalize(vec3(0.5, 0.0, 0.1));
+#define CLOUD_TOP_OFFSET 30.0
+float sampleCloudDensity(vec3 p, bool expensive, float lod){
+	float heightFraction = getHeightFraction(p);
+	vec2 uv = getUVProjection(p);
+	vec3 animation = heightFraction * windDirection * CLOUD_TOP_OFFSET + windDirection * iTime * speed;
+	vec2 moving_uv = getUVProjection(p + animation);
+
+	if(heightFraction < 0.0 || heightFraction > 1.0){
+		return 0.0;
+	}
+
+	vec4 low_frequency_noise = textureLod(cloud, vec3(uv * crispiness, heightFraction), lod);
+	float lowFreqFBM = dot(low_frequency_noise.gba, vec3(0.625, 0.25, 0.125));
+	float base_cloud = remap(low_frequency_noise.r, -(1.0 - lowFreqFBM), 1., 0.0 , 1.0);
+	
+	float density = getDensityForCloud(heightFraction, type);
+	base_cloud *= (density/heightFraction);
+
+	vec3 weather_data = texture(weatherTex, moving_uv).rgb;
+	float cloud_coverage = weather_data.r * coverage;
+	float base_cloud_with_coverage = remap(base_cloud , cloud_coverage , 1.0 , 0.0 , 1.0);
+	base_cloud_with_coverage *= cloud_coverage;
+
+	if(expensive)
+	{
+		vec3 erodeCloudNoise = textureLod(worley32, vec3(moving_uv * crispiness, heightFraction) * curliness, lod).rgb;
+		float highFreqFBM = dot(erodeCloudNoise.rgb, vec3(0.625, 0.25, 0.125));
+		float highFreqNoiseModifier = mix(highFreqFBM, 1.0 - highFreqFBM, clamp(heightFraction * 10.0, 0.0, 1.0));
+
+		base_cloud_with_coverage = base_cloud_with_coverage - highFreqNoiseModifier * (1.0 - base_cloud_with_coverage);
+
+		base_cloud_with_coverage = remap(base_cloud_with_coverage*2.0, highFreqNoiseModifier * 0.2, 1.0, 0.0, 1.0);
+	}
+
+	return clamp(base_cloud_with_coverage, 0.0, 1.0);
+}
+
+uniform vec3 noiseKernel[6u] = vec3[] 
+(
+	vec3( 0.38051305,  0.92453449, -0.02111345),
+	vec3(-0.50625799, -0.03590792, -0.86163418),
+	vec3(-0.32509218, -0.94557439,  0.01428793),
+	vec3( 0.09026238, -0.27376545,  0.95755165),
+	vec3( 0.28128598,  0.42443639, -0.86065785),
+	vec3(-0.16852403,  0.14748697,  0.97460106)
+);
+float raymarchToLight(vec3 pos)
+{
+	vec3 startPos,endPos;
+	if(HitBox(pos,lightDirection,startPos,endPos)){
+		float CONE_STEP = 1.0 / LIGHT_STEP;
+		float coneRadius = 1.0; 
+
+		float len = length(endPos - pos);
+		float ds = len / LIGHT_STEP;
+		vec3 rayStep = lightDirection * ds;
+
+		float sigma_ds = -ds * absorption;
+
+		float density = 0.0;
+		vec3 currentPos = pos;
+		float T = 1.0;
+		for(int i = 0; i < LIGHT_STEP; i++)
+		{
+			vec3 scatterPos = currentPos + coneRadius*noiseKernel[i]*float(i); // 随机散射方向
+
+			float heightFraction = getHeightFraction(scatterPos);
+			if(heightFraction > 0.)
+			{
+				float cloudDensity = sampleCloudDensity(scatterPos, density > 0.3, i/16);
+				if(cloudDensity > 0.0)
+				{
+					float Ti = exp(cloudDensity * sigma_ds);
+					T *= Ti;
+					density += cloudDensity;
+				}
+			}
+			currentPos += rayStep;
+			coneRadius += CONE_STEP;
+		}
+
+		return T;		
+	}
+	return 1.0;
+}
+
+
+#define BAYER_FACTOR 1.0/16.0
+uniform float bayerFilter[16u] = float[]
+(
+	0.0*BAYER_FACTOR, 8.0*BAYER_FACTOR, 2.0*BAYER_FACTOR, 10.0*BAYER_FACTOR,
+	12.0*BAYER_FACTOR, 4.0*BAYER_FACTOR, 14.0*BAYER_FACTOR, 6.0*BAYER_FACTOR,
+	3.0*BAYER_FACTOR, 11.0*BAYER_FACTOR, 1.0*BAYER_FACTOR, 9.0*BAYER_FACTOR,
+	15.0*BAYER_FACTOR, 7.0*BAYER_FACTOR, 13.0*BAYER_FACTOR, 5.0*BAYER_FACTOR
+);
+vec4 raymarchToCloud(vec3 startPos, vec3 endPos, vec3 bg){
+	vec3 path = endPos - startPos;
+	float len = length(path);
+	float ds = len / CLOUD_STEP;
+	vec3 marchStep = normalize(path) * ds;
+	float sigma_ds = -ds * densityFactor;
+
+	uvec2 fragCoord = gl_GlobalInvocationID.xy;
+	int a = int(fragCoord.x) % 4;
+	int b = int(fragCoord.y) % 4;
+
+    vec4 col = vec4(0.0);
+
+    vec3 currentPos = startPos + normalize(path) * bayerFilter[a + b * 4];
+
+	float lightDotEye = dot(normalize(lightDirection), normalize(path));
+
+	float T = 1.0;
+    for(int i = 0;i< CLOUD_STEP;i++){
+		float density_sample = sampleCloudDensity(currentPos, true, i/16);
+		if(density_sample > 0.)
+		{
+			float height = getHeightFraction(currentPos);
+			vec3 ambientLight = cloudColorBottom;
+
+			float light_density = raymarchToLight(currentPos);
+			float scattering = mix(HG(lightDotEye, -0.08), HG(lightDotEye, 0.08), clamp(lightDotEye*0.5 + 0.5, 0.0, 1.0));
+			scattering = max(scattering, 1.0);
+
+			vec3 S = 0.6*( mix( mix(ambientLight*1.8, bg, 0.2), scattering*lightCol, light_density)) * density_sample;
+			float dTrans = exp(density_sample * sigma_ds);
+			vec3 Sint = (S - S * dTrans) * (1. / density_sample);
+			
+			col.rgb += T * Sint;
+			T *= dTrans;
+		}
+		if( T < 0.1 ) break;
+		currentPos += marchStep;
+	}
+	
+	col.a = 1.0 - T;
+	
+	return col;
+}
+
+void main(){
+    ivec2 texelCoord = ivec2(gl_GlobalInvocationID.xy);
+	
+    vec4 bg = getSkyColor();
+    vec4 fragColor_v;
+
+    vec3 worldDir = getWorldDir();
+    vec3 startPos,endPos;
+    if(HitBox(cameraPosition,worldDir,startPos,endPos)){
+		vec4 v_cloud = raymarchToCloud(startPos,endPos,bg.rgb);
+
+		float cloudAlphaness = threshold(v_cloud.a, 0.2);
+		v_cloud.rgb = v_cloud.rgb*1.8 - 0.1;
+
+		float sun = clamp( dot(lightDirection,normalize(endPos - startPos)), 0.0, 1.0 );
+		vec3 s = 0.8*vec3(1.0,0.4,0.2)*pow( sun, 256.0 );
+		v_cloud.rgb += s*v_cloud.a;
+
+		bg.rgb = bg.rgb*(1.0 - v_cloud.a) + v_cloud.rgb;
+		bg.a = 1.0;
+
+		fragColor_v = bg;
+		fragColor_v.a = cloudAlphaness;		
+	}else{
+		bg.a = 1.0;
+		fragColor_v = bg;
+	}
+
+    imageStore(outCloudTex, texelCoord, fragColor_v);
+}

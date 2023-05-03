@@ -1,0 +1,28 @@
+﻿  Cloud.cpp
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Camera.h(124,1): warning C4305: “=”: 从“double”到“T”截断
+          with
+          [
+              T=float
+          ]
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Camera.h(125,1): warning C4305: “=”: 从“double”到“T”截断
+          with
+          [
+              T=float
+          ]
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Camera.h(126,1): warning C4305: “=”: 从“double”到“T”截断
+          with
+          [
+              T=float
+          ]
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Camera.h(127,1): warning C4305: “=”: 从“double”到“T”截断
+          with
+          [
+              T=float
+          ]
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Camera.h(131,14): warning C4244: “初始化”: 从“double”转换到“float”，可能丢失数据
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Camera.h(148,1): warning C4305: “参数”: 从“double”到“float”截断
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Cloud.cpp(9,20): warning C4305: “=”: 从“double”到“float”截断
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Cloud.cpp(13,16): warning C4305: “=”: 从“double”到“float”截断
+C:\OpenGL_source\Volume-cloud\Volume-cloud\Cloud.cpp(69,40): warning C4244: “参数”: 从“double”转换到“float”，可能丢失数据
+LINK : warning LNK4098: 默认库“MSVCRT”与其他库的使用冲突；请使用 /NODEFAULTLIB:library
+  Volume-cloud.vcxproj -> C:\OpenGL_source\Volume-cloud\x64\Debug\Volume-cloud.exe
